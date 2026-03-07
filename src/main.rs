@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
     let registry = InstrumentRegistry::new();
     let ticker_cache = TickerCache::new();
     let orderbook_manager = OrderBookManager::new();
-    let storage = Storage::new(&config.db_path)?;
+    let storage = Storage::new(&config.db_path).await?;
 
     let ws_manager = WsManager::new(config.clone(), event_bus.clone());
     let ws_client = ws_manager.client();

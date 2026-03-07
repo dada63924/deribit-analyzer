@@ -13,19 +13,22 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn new(db_path: &str) -> Result<Self> {
-        let conn = Connection::open(db_path)
-            .context("Failed to open SQLite database")?;
+    pub async fn new(db_path: &str) -> Result<Self> {
+        let path = db_path.to_string();
+        let conn = tokio::task::spawn_blocking(move || {
+            Connection::open(&path).context("Failed to open SQLite database")
+        })
+        .await??;
 
         let storage = Storage {
             conn: Arc::new(Mutex::new(conn)),
         };
-        storage.initialize()?;
+        storage.initialize().await?;
         Ok(storage)
     }
 
-    fn initialize(&self) -> Result<()> {
-        let conn = self.conn.blocking_lock();
+    async fn initialize(&self) -> Result<()> {
+        let conn = self.conn.lock().await;
 
         conn.execute_batch(
             "

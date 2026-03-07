@@ -151,22 +151,6 @@ impl WsManager {
         let (sender_tx, mut sender_rx) = mpsc::channel::<Message>(256);
         *self.client.sender_tx.lock().await = Some(sender_tx.clone());
 
-        // Authenticate
-        self.authenticate().await?;
-
-        // Setup heartbeat
-        let _result = self
-            .client
-            .send_request(
-                "public/set_heartbeat",
-                json!({"interval": self.config.heartbeat_interval}),
-            )
-            .await?;
-        info!("Heartbeat configured");
-
-        // Notify waiters that we're connected
-        self.connected_notify.notify_waiters();
-
         let pending_requests = self.client.pending_requests.clone();
         let event_bus = self.event_bus.clone();
         let auth_state = self.auth_state.clone();
@@ -175,7 +159,17 @@ impl WsManager {
         let request_id = self.client.request_id.clone();
         let sender_for_refresh = sender_tx.clone();
 
-        // Spawn message reader
+        // Start writer: forwards channel messages to WebSocket sink
+        let writer_handle = tokio::spawn(async move {
+            while let Some(msg) = sender_rx.recv().await {
+                if let Err(e) = ws_sink.send(msg).await {
+                    error!(error = %e, "Failed to send WebSocket message");
+                    break;
+                }
+            }
+        });
+
+        // Start reader: reads from WebSocket stream and dispatches
         let reader_handle = tokio::spawn(async move {
             let mut refresh_interval = interval(Duration::from_secs(30));
             refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -245,12 +239,25 @@ impl WsManager {
             }
         });
 
-        // Forward outgoing messages to WebSocket sink
-        while let Some(msg) = sender_rx.recv().await {
-            ws_sink.send(msg).await?;
-        }
+        // Now authenticate (reader & writer are already running)
+        self.authenticate().await?;
 
-        reader_handle.abort();
+        // Setup heartbeat
+        let _result = self
+            .client
+            .send_request(
+                "public/set_heartbeat",
+                json!({"interval": self.config.heartbeat_interval}),
+            )
+            .await?;
+        info!("Heartbeat configured");
+
+        // Notify waiters that we're connected
+        self.connected_notify.notify_waiters();
+
+        // Wait for reader to finish (connection closed)
+        let _ = reader_handle.await;
+        writer_handle.abort();
         Ok(())
     }
 
