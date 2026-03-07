@@ -179,6 +179,30 @@ impl WsManager {
                     msg = ws_stream.next() => {
                         match msg {
                             Some(Ok(Message::Text(text))) => {
+                                // Respond to heartbeat test_request
+                                if text.contains("\"test_request\"") {
+                                    if let Ok(hb) = serde_json::from_str::<serde_json::Value>(&text) {
+                                        if hb.get("method").and_then(|m| m.as_str()) == Some("heartbeat")
+                                            && hb["params"]["type"].as_str() == Some("test_request")
+                                        {
+                                            let hb_id = {
+                                                let mut id_lock = request_id.lock().await;
+                                                let id = *id_lock;
+                                                *id_lock += 1;
+                                                id
+                                            };
+                                            let resp = serde_json::json!({
+                                                "jsonrpc": "2.0",
+                                                "id": hb_id,
+                                                "method": "public/test",
+                                                "params": {}
+                                            });
+                                            let _ = sender_tx.send(Message::Text(resp.to_string())).await;
+                                            debug!("Responded to heartbeat test_request");
+                                            continue;
+                                        }
+                                    }
+                                }
                                 handle_message(
                                     &text,
                                     &pending_requests,
@@ -324,14 +348,6 @@ async fn handle_message(
             return;
         }
     };
-
-    // Handle heartbeat test_request
-    if msg.get("method").and_then(|m| m.as_str()) == Some("heartbeat") {
-        if msg["params"]["type"].as_str() == Some("test_request") {
-            debug!("Received heartbeat test_request");
-        }
-        return;
-    }
 
     // RPC response (has "id")
     if let Some(id) = msg.get("id").and_then(|id| id.as_u64()) {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::analysis::opportunity::Opportunity;
+use crate::analysis::opportunity::{Opportunity, RiskLevel, TradeLeg};
 use crate::events::bus::TickerData;
 use crate::market::instruments::Instrument;
 
@@ -128,6 +128,56 @@ impl Storage {
             ],
         )?;
         Ok(())
+    }
+
+    /// Load opportunities with id > after_id, returns (db_id, Opportunity) pairs
+    pub async fn load_opportunities_after(&self, after_id: i64) -> Result<Vec<(i64, Opportunity)>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, strategy_type, description, expected_profit, risk_level, instruments, legs, detected_at
+             FROM opportunities WHERE id > ?1 ORDER BY id",
+        )?;
+        let mut results = Vec::new();
+        let rows = stmt.query_map([after_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, strategy_type, description, expected_profit, risk_str, instruments_json, legs_json, detected_at) = row?;
+            let risk_level = match risk_str.as_str() {
+                "low" => RiskLevel::Low,
+                "medium" => RiskLevel::Medium,
+                _ => RiskLevel::High,
+            };
+            let instruments: Vec<String> = serde_json::from_str(&instruments_json).unwrap_or_default();
+            let legs: Vec<TradeLeg> = serde_json::from_str(&legs_json).unwrap_or_default();
+            results.push((id, Opportunity {
+                strategy_type,
+                description,
+                legs,
+                expected_profit,
+                total_cost: 0.0,
+                risk_level,
+                instruments,
+                detected_at,
+            }));
+        }
+        Ok(results)
+    }
+
+    /// Count active instruments
+    pub async fn count_instruments(&self) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM instruments", [], |row| row.get(0))?;
+        Ok(count as usize)
     }
 
     pub async fn save_opportunity(&self, opp: &Opportunity) -> Result<()> {

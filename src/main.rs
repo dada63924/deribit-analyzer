@@ -1,31 +1,23 @@
-mod alert;
-mod analysis;
-mod config;
-mod events;
-mod market;
-mod storage;
-mod ws;
-
 use anyhow::Result;
 use serde_json::json;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
-use crate::analysis::box_spread::BoxSpreadAnalyzer;
-use crate::analysis::calendar_arb::CalendarArbAnalyzer;
-use crate::analysis::calendar_spread::CalendarSpreadAnalyzer;
-use crate::analysis::conversion::ConversionAnalyzer;
-use crate::analysis::put_call_parity::PutCallParityAnalyzer;
-use crate::analysis::vertical_arb::VerticalArbAnalyzer;
-use crate::analysis::vol_surface::VolSurfaceAnalyzer;
-use crate::config::Config;
-use crate::events::bus::{Event, EventBus};
-use crate::market::instruments::InstrumentRegistry;
-use crate::market::orderbook::OrderBookManager;
-use crate::market::subscriber::Subscriber;
-use crate::market::ticker::TickerCache;
-use crate::storage::sqlite::Storage;
-use crate::ws::client::WsManager;
+use deribit::analysis::box_spread::BoxSpreadAnalyzer;
+use deribit::analysis::calendar_arb::CalendarArbAnalyzer;
+use deribit::analysis::calendar_spread::CalendarSpreadAnalyzer;
+use deribit::analysis::conversion::ConversionAnalyzer;
+use deribit::analysis::put_call_parity::PutCallParityAnalyzer;
+use deribit::analysis::vertical_arb::VerticalArbAnalyzer;
+use deribit::analysis::vol_surface::VolSurfaceAnalyzer;
+use deribit::config::Config;
+use deribit::events::bus::{Event, EventBus};
+use deribit::market::instruments::InstrumentRegistry;
+use deribit::market::orderbook::OrderBookManager;
+use deribit::market::subscriber::Subscriber;
+use deribit::market::ticker::TickerCache;
+use deribit::storage::sqlite::Storage;
+use deribit::ws::client::WsManager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -54,7 +46,7 @@ async fn main() -> Result<()> {
     let ws_client = ws_manager.client();
 
     // WS connection loop
-    let _ws_handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         if let Err(e) = ws_manager.run().await {
             error!(error = %e, "WebSocket manager fatal error");
         }
@@ -117,24 +109,20 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Analysis task — all 7 analyzers
+    // Analysis task
     let analysis_registry = registry.clone();
     let analysis_ticker = ticker_cache.clone();
     let analysis_event_bus = event_bus.clone();
     let alert_threshold = config.alert_threshold;
     tokio::spawn(async move {
-        // === Risk-free arbitrage (exact pricing violations) ===
         let pcp = PutCallParityAnalyzer::new(alert_threshold);
-        let box_spread = BoxSpreadAnalyzer::new(10.0); // min $10 profit
+        let box_spread = BoxSpreadAnalyzer::new(10.0);
         let conversion = ConversionAnalyzer::new(10.0);
         let vertical = VerticalArbAnalyzer::new(5.0);
         let calendar_arb = CalendarArbAnalyzer::new(5.0);
-
-        // === Soft signals (IV-based) ===
         let vol_surface = VolSurfaceAnalyzer::new(15.0);
         let calendar_spread = CalendarSpreadAnalyzer::new(10.0);
 
-        // Wait for data
         tokio::time::sleep(Duration::from_secs(30)).await;
         info!("Starting arbitrage scanning...");
 
@@ -145,7 +133,6 @@ async fn main() -> Result<()> {
             let reg = &analysis_registry;
             let tc = &analysis_ticker;
 
-            // Risk-free scans
             let mut arb_count = 0;
             for opp in pcp.scan_all(reg, tc).await {
                 analysis_event_bus.publish(Event::OpportunityFound(opp));
@@ -168,7 +155,6 @@ async fn main() -> Result<()> {
                 arb_count += 1;
             }
 
-            // Soft signal scans
             let mut signal_count = 0;
             for opp in vol_surface.scan(reg, tc).await {
                 analysis_event_bus.publish(Event::OpportunityFound(opp));
@@ -189,11 +175,25 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Notifier
-    let notifier = alert::notifier::Notifier::new(storage.clone());
-    let notifier_bus = event_bus.clone();
+    // Opportunity saver
+    let storage_opp = storage.clone();
+    let opp_bus = event_bus.clone();
     tokio::spawn(async move {
-        notifier.run(&notifier_bus).await;
+        let mut rx = opp_bus.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(Event::OpportunityFound(opp)) => {
+                    if let Err(e) = storage_opp.save_opportunity(&opp).await {
+                        warn!(error = %e, "Failed to save opportunity");
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(skipped = n, "Opportunity saver lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                _ => {}
+            }
+        }
     });
 
     // Wait for WS connection
@@ -219,7 +219,7 @@ async fn main() -> Result<()> {
 }
 
 async fn load_and_subscribe(
-    client: &ws::client::WsClient,
+    client: &deribit::ws::client::WsClient,
     registry: &InstrumentRegistry,
     storage: &Storage,
     event_bus: &EventBus,
