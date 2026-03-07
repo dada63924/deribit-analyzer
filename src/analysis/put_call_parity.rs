@@ -1,0 +1,154 @@
+use tracing::info;
+
+use crate::analysis::opportunity::{Opportunity, RiskLevel, TradeLeg};
+use crate::market::instruments::InstrumentRegistry;
+use crate::market::ticker::TickerCache;
+
+/// Put-Call Parity Arbitrage
+/// C - P = S - K × e^(-rT)
+/// Deribit prices in BTC: C - P = 1 - (K/S) × e^(-rT)
+pub struct PutCallParityAnalyzer {
+    threshold: f64,
+    risk_free_rate: f64,
+}
+
+impl PutCallParityAnalyzer {
+    pub fn new(threshold: f64) -> Self {
+        PutCallParityAnalyzer {
+            threshold,
+            risk_free_rate: 0.05,
+        }
+    }
+
+    pub async fn check_pair(
+        &self,
+        registry: &InstrumentRegistry,
+        ticker_cache: &TickerCache,
+        strike: f64,
+        expiration: i64,
+    ) -> Option<Opportunity> {
+        let (call_inst, put_inst) = registry.find_pair(strike, expiration).await?;
+
+        let call_ticker = ticker_cache.get(&call_inst.instrument_name).await?;
+        let put_ticker = ticker_cache.get(&put_inst.instrument_name).await?;
+
+        let call_bid = call_ticker.best_bid_price?;
+        let call_ask = call_ticker.best_ask_price?;
+        let put_bid = put_ticker.best_bid_price?;
+        let put_ask = put_ticker.best_ask_price?;
+
+        let underlying = call_ticker.underlying_price;
+        if underlying <= 0.0 {
+            return None;
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let time_to_expiry = (expiration - now) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0);
+        if time_to_expiry <= 0.0 {
+            return None;
+        }
+
+        let discount = (-self.risk_free_rate * time_to_expiry).exp();
+        let theoretical_diff = 1.0 - (strike / underlying) * discount;
+        let fee = 0.0003 * 2.0;
+
+        // Direction 1: Buy call + Sell put (synthetic long)
+        let market_diff_1 = call_ask - put_bid;
+        let profit_1 = theoretical_diff - market_diff_1;
+
+        if profit_1 > self.threshold + fee {
+            let profit_usd = profit_1 * underlying;
+            let cost_usd = market_diff_1 * underlying;
+
+            info!(
+                call = %call_inst.instrument_name,
+                put = %put_inst.instrument_name,
+                profit_usd = profit_usd,
+                "PCP: Buy call + Sell put"
+            );
+
+            return Some(Opportunity {
+                strategy_type: "put_call_parity".to_string(),
+                description: format!(
+                    "Synthetic long underpriced vs underlying | Strike {} | Expiry {} days",
+                    strike,
+                    (time_to_expiry * 365.25) as i32
+                ),
+                legs: vec![
+                    TradeLeg::buy(1, &call_inst.instrument_name, call_ask, 1.0),
+                    TradeLeg::sell(2, &put_inst.instrument_name, put_bid, 1.0),
+                ],
+                expected_profit: profit_usd,
+                total_cost: cost_usd,
+                risk_level: RiskLevel::Low,
+                instruments: vec![
+                    call_inst.instrument_name.clone(),
+                    put_inst.instrument_name.clone(),
+                ],
+                detected_at: chrono::Utc::now().timestamp(),
+            });
+        }
+
+        // Direction 2: Sell call + Buy put (synthetic short)
+        let market_diff_2 = call_bid - put_ask;
+        let profit_2 = market_diff_2 - theoretical_diff;
+
+        if profit_2 > self.threshold + fee {
+            let profit_usd = profit_2 * underlying;
+            let revenue_usd = market_diff_2 * underlying;
+
+            info!(
+                call = %call_inst.instrument_name,
+                put = %put_inst.instrument_name,
+                profit_usd = profit_usd,
+                "PCP: Sell call + Buy put"
+            );
+
+            return Some(Opportunity {
+                strategy_type: "put_call_parity".to_string(),
+                description: format!(
+                    "Synthetic short overpriced vs underlying | Strike {} | Expiry {} days",
+                    strike,
+                    (time_to_expiry * 365.25) as i32
+                ),
+                legs: vec![
+                    TradeLeg::sell(1, &call_inst.instrument_name, call_bid, 1.0),
+                    TradeLeg::buy(2, &put_inst.instrument_name, put_ask, 1.0),
+                ],
+                expected_profit: profit_usd,
+                total_cost: revenue_usd.abs(),
+                risk_level: RiskLevel::Low,
+                instruments: vec![
+                    call_inst.instrument_name.clone(),
+                    put_inst.instrument_name.clone(),
+                ],
+                detected_at: chrono::Utc::now().timestamp(),
+            });
+        }
+
+        None
+    }
+
+    pub async fn scan_all(
+        &self,
+        registry: &InstrumentRegistry,
+        ticker_cache: &TickerCache,
+    ) -> Vec<Opportunity> {
+        let mut opportunities = Vec::new();
+        let expirations = registry.get_expirations().await;
+
+        for expiration in &expirations {
+            let strikes = registry.get_strikes_for_expiration(*expiration).await;
+            for strike in &strikes {
+                if let Some(opp) = self
+                    .check_pair(registry, ticker_cache, *strike, *expiration)
+                    .await
+                {
+                    opportunities.push(opp);
+                }
+            }
+        }
+
+        opportunities
+    }
+}

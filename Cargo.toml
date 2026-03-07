@@ -1,0 +1,21 @@
+[package]
+name = "deribit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+futures-util = "0.3"
+url = "2"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+dotenvy = "0.15"
