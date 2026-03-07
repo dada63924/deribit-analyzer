@@ -84,26 +84,62 @@ pub struct Opportunity {
 }
 
 impl Opportunity {
-    /// Calculate annualized return based on profit, cost, and time to expiry
-    /// Annualized return = ROI × (365 / days_to_expiry)
-    /// Uses detected_at as baseline for stable calculation.
-    /// Returns None for sub-day durations (annualizing is meaningless).
-    pub fn annualized_return(&self) -> Option<f64> {
+    /// Total USD notional of futures legs (identified by PriceUnit::Usd)
+    pub fn futures_notional_usd(&self) -> f64 {
+        self.legs
+            .iter()
+            .filter(|l| matches!(l.price_unit, PriceUnit::Usd))
+            .map(|l| l.price * l.amount)
+            .sum()
+    }
+
+    /// Net futures delta in BTC (positive = long, negative = short)
+    pub fn futures_delta_btc(&self) -> f64 {
+        self.legs
+            .iter()
+            .filter(|l| matches!(l.price_unit, PriceUnit::Usd))
+            .map(|l| {
+                let sign = match l.action {
+                    Action::Buy => 1.0,
+                    Action::Sell => -1.0,
+                };
+                sign * l.amount
+            })
+            .sum()
+    }
+
+    /// Cost adjusted for leverage (only futures margin is reduced)
+    pub fn leveraged_cost(&self, leverage: f64) -> f64 {
+        let base = self.total_cost.abs();
+        if leverage <= 1.0 {
+            return base;
+        }
+        let futures_usd = self.futures_notional_usd();
+        let option_cost = (base - futures_usd).max(0.0);
+        option_cost + futures_usd / leverage
+    }
+
+    /// Annualized return with leverage adjustment
+    pub fn annualized_return_leveraged(&self, leverage: f64) -> Option<f64> {
         if self.expected_profit <= 0.0 {
             return None;
         }
-        let cost = self.total_cost.abs();
+        let cost = self.leveraged_cost(leverage);
         if cost < 1.0 {
             return None;
         }
         let expiry_ms = self.expiry_timestamp?;
-        let detected_ms = self.detected_at * 1000; // detected_at is in seconds
+        let detected_ms = self.detected_at * 1000;
         let days = (expiry_ms - detected_ms) as f64 / 86_400_000.0;
         if days < 1.0 {
             return None;
         }
-        let roi = self.expected_profit / cost;
-        Some(roi * 365.0 / days)
+        Some((self.expected_profit / cost) * 365.0 / days)
+    }
+
+    /// Calculate annualized return at 1x leverage
+    pub fn annualized_return(&self) -> Option<f64> {
+        self.annualized_return_leveraged(1.0)
     }
 }
 

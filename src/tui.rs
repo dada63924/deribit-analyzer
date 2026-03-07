@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 
 use crate::analysis::opportunity::{Action, Opportunity, RiskLevel};
+use crate::analysis::portfolio::PortfolioOptimizer;
 
 pub enum TuiEvent {
     Opportunity(Opportunity),
@@ -28,6 +29,12 @@ enum Filter {
     All,
     Arbitrage,
     Signal,
+    Pcp,
+    Spread,
+    ConvRev,
+    Calendar,
+    Vol,
+    Portfolio,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -36,6 +43,8 @@ enum SortBy {
     Time,
     Apy,
 }
+
+const LEVERAGE_OPTIONS: [f64; 4] = [1.0, 2.0, 5.0, 10.0];
 
 struct App {
     opportunities: Vec<Opportunity>,
@@ -50,6 +59,10 @@ struct App {
     should_quit: bool,
     connected: bool,
     instrument_count: usize,
+    leverage_idx: usize,
+    /// Portfolio combinations (recomputed periodically)
+    portfolios: Vec<Opportunity>,
+    portfolio_optimizer: PortfolioOptimizer,
 }
 
 impl App {
@@ -66,7 +79,14 @@ impl App {
             should_quit: false,
             connected: false,
             instrument_count: 0,
+            leverage_idx: 0,
+            portfolios: Vec::new(),
+            portfolio_optimizer: PortfolioOptimizer::new(1.0),
         }
+    }
+
+    fn leverage(&self) -> f64 {
+        LEVERAGE_OPTIONS[self.leverage_idx]
     }
 
     fn opp_key(opp: &Opportunity) -> String {
@@ -90,35 +110,81 @@ impl App {
         }
     }
 
+    fn recompute_portfolios(&mut self) {
+        self.portfolio_optimizer.set_leverage(self.leverage());
+        self.portfolios = self.portfolio_optimizer.find_best(&self.opportunities, 10);
+    }
+
+    /// Get the display list: either main opportunities or portfolio combos
+    fn display_opps(&self) -> &[Opportunity] {
+        if self.filter == Filter::Portfolio {
+            &self.portfolios
+        } else {
+            &self.opportunities
+        }
+    }
+
     fn update_filtered(&mut self) {
         // Remember current selection by key
         if let Some(sel) = self.table_state.selected() {
             if let Some(&idx) = self.filtered.get(sel) {
-                self.selected_key = Some(Self::opp_key(&self.opportunities[idx]));
+                let opps = self.display_opps();
+                if idx < opps.len() {
+                    self.selected_key = Some(Self::opp_key(&opps[idx]));
+                }
             }
         }
 
         let now = chrono::Utc::now().timestamp();
-        let stale_threshold = 60; // hide opportunities not refreshed in 60s
+        let stale_threshold = 60;
 
-        self.filtered = self
-            .opportunities
-            .iter()
-            .enumerate()
-            .filter(|(_, opp)| {
-                if now - opp.detected_at > stale_threshold {
-                    return false;
-                }
-                match self.filter {
-                    Filter::All => true,
-                    Filter::Arbitrage => is_arb(&opp.strategy_type),
-                    Filter::Signal => !is_arb(&opp.strategy_type),
-                }
-            })
-            .map(|(i, _)| i)
-            .collect();
+        if self.filter == Filter::Portfolio {
+            // Portfolio mode: show all portfolio combos (already top 10)
+            self.filtered = (0..self.portfolios.len()).collect();
+        } else {
+            self.filtered = self
+                .opportunities
+                .iter()
+                .enumerate()
+                .filter(|(_, opp)| {
+                    if now - opp.detected_at > stale_threshold {
+                        return false;
+                    }
+                    match self.filter {
+                        Filter::All => true,
+                        Filter::Arbitrage => is_arb(&opp.strategy_type),
+                        Filter::Signal => !is_arb(&opp.strategy_type),
+                        Filter::Pcp => opp.strategy_type == "put_call_parity",
+                        Filter::Spread => matches!(
+                            opp.strategy_type.as_str(),
+                            "vertical_arb" | "butterfly_arb" | "box_spread"
+                        ),
+                        Filter::ConvRev => matches!(
+                            opp.strategy_type.as_str(),
+                            "conversion" | "reversal"
+                        ),
+                        Filter::Calendar => matches!(
+                            opp.strategy_type.as_str(),
+                            "calendar_arb" | "calendar_spread"
+                        ),
+                        Filter::Vol => matches!(
+                            opp.strategy_type.as_str(),
+                            "vol_surface_anomaly" | "butterfly_spread"
+                        ),
+                        Filter::Portfolio => unreachable!(),
+                    }
+                })
+                .map(|(i, _)| i)
+                .collect();
+        }
 
-        let opps = &self.opportunities;
+        let leverage = self.leverage();
+        let is_portfolio = self.filter == Filter::Portfolio;
+        let opps: &[Opportunity] = if is_portfolio {
+            &self.portfolios
+        } else {
+            &self.opportunities
+        };
         match self.sort_by {
             SortBy::Profit => self.filtered.sort_by(|a, b| {
                 opps[*b]
@@ -130,8 +196,8 @@ impl App {
                 opps[*b].detected_at.cmp(&opps[*a].detected_at)
             }),
             SortBy::Apy => self.filtered.sort_by(|a, b| {
-                let apy_a = opps[*a].annualized_return().unwrap_or(0.0);
-                let apy_b = opps[*b].annualized_return().unwrap_or(0.0);
+                let apy_a = opps[*a].annualized_return_leveraged(leverage).unwrap_or(0.0);
+                let apy_b = opps[*b].annualized_return_leveraged(leverage).unwrap_or(0.0);
                 apy_b.partial_cmp(&apy_a).unwrap_or(std::cmp::Ordering::Equal)
             }),
         }
@@ -139,7 +205,7 @@ impl App {
         // Restore selection by key
         if let Some(ref key) = self.selected_key {
             if let Some(pos) = self.filtered.iter().position(|&idx| {
-                Self::opp_key(&self.opportunities[idx]) == *key
+                Self::opp_key(&opps[idx]) == *key
             }) {
                 self.table_state.select(Some(pos));
             }
@@ -207,7 +273,10 @@ async fn run_inner(opp_rx: &mut mpsc::UnboundedReceiver<TuiEvent>) -> Result<()>
             }
             tui_event = opp_rx.recv() => {
                 match tui_event {
-                    Some(TuiEvent::Opportunity(opp)) => app.add_opportunity(opp),
+                    Some(TuiEvent::Opportunity(opp)) => {
+                        app.add_opportunity(opp);
+                        app.recompute_portfolios();
+                    }
                     Some(TuiEvent::Connected { instrument_count }) => {
                         app.connected = true;
                         app.instrument_count = instrument_count;
@@ -260,20 +329,29 @@ fn handle_key(app: &mut App, key: event::KeyEvent) {
                     app.view = View::Detail;
                 }
             }
-            KeyCode::Char('1') => {
-                app.filter = Filter::All;
+            KeyCode::Char(c @ '1'..='9') => {
+                app.filter = match c {
+                    '1' => Filter::All,
+                    '2' => Filter::Arbitrage,
+                    '3' => Filter::Signal,
+                    '4' => Filter::Pcp,
+                    '5' => Filter::Spread,
+                    '6' => Filter::ConvRev,
+                    '7' => Filter::Calendar,
+                    '8' => Filter::Vol,
+                    '9' => {
+                        app.recompute_portfolios();
+                        Filter::Portfolio
+                    }
+                    _ => unreachable!(),
+                };
                 app.update_filtered();
                 app.table_state.select(if app.filtered.is_empty() { None } else { Some(0) });
             }
-            KeyCode::Char('2') => {
-                app.filter = Filter::Arbitrage;
+            KeyCode::Char('l') => {
+                app.leverage_idx = (app.leverage_idx + 1) % LEVERAGE_OPTIONS.len();
+                app.recompute_portfolios();
                 app.update_filtered();
-                app.table_state.select(if app.filtered.is_empty() { None } else { Some(0) });
-            }
-            KeyCode::Char('3') => {
-                app.filter = Filter::Signal;
-                app.update_filtered();
-                app.table_state.select(if app.filtered.is_empty() { None } else { Some(0) });
             }
             KeyCode::Char('s') => {
                 app.sort_by = match app.sort_by {
@@ -310,11 +388,18 @@ fn draw_list(f: &mut Frame, app: &mut App) {
     .split(f.area());
 
     // Header
+    let leverage = app.leverage();
+    let lev_str = if leverage > 1.0 {
+        format!(" | {}x leverage", leverage as i32)
+    } else {
+        String::new()
+    };
     let status = if app.connected {
         format!(
-            "Connected | {} instruments | {} opportunities",
+            "Connected | {} instruments | {} opportunities{}",
             app.instrument_count,
-            app.filtered.len()
+            app.filtered.len(),
+            lev_str,
         )
     } else {
         "Connecting...".to_string()
@@ -338,16 +423,63 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         .collect();
     let arb_count = active.iter().filter(|o| is_arb(&o.strategy_type)).count();
     let sig_count = active.len() - arb_count;
+    let pcp_count = active
+        .iter()
+        .filter(|o| o.strategy_type == "put_call_parity")
+        .count();
+    let spread_count = active
+        .iter()
+        .filter(|o| {
+            matches!(
+                o.strategy_type.as_str(),
+                "vertical_arb" | "butterfly_arb" | "box_spread"
+            )
+        })
+        .count();
+    let conv_count = active
+        .iter()
+        .filter(|o| matches!(o.strategy_type.as_str(), "conversion" | "reversal"))
+        .count();
+    let cal_count = active
+        .iter()
+        .filter(|o| {
+            matches!(
+                o.strategy_type.as_str(),
+                "calendar_arb" | "calendar_spread"
+            )
+        })
+        .count();
+    let vol_count = active
+        .iter()
+        .filter(|o| {
+            matches!(
+                o.strategy_type.as_str(),
+                "vol_surface_anomaly" | "butterfly_spread"
+            )
+        })
+        .count();
     let tabs = Tabs::new(vec![
         format!("All [{}]", active.len()),
-        format!("Arbitrage [{}]", arb_count),
-        format!("Signals [{}]", sig_count),
+        format!("Arb [{}]", arb_count),
+        format!("Sig [{}]", sig_count),
+        format!("PCP [{}]", pcp_count),
+        format!("Sprd [{}]", spread_count),
+        format!("C/R [{}]", conv_count),
+        format!("Cal [{}]", cal_count),
+        format!("Vol [{}]", vol_count),
+        format!("Port [{}]", app.portfolios.len()),
     ])
     .block(Block::bordered())
     .select(match app.filter {
         Filter::All => 0,
         Filter::Arbitrage => 1,
         Filter::Signal => 2,
+        Filter::Pcp => 3,
+        Filter::Spread => 4,
+        Filter::ConvRev => 5,
+        Filter::Calendar => 6,
+        Filter::Vol => 7,
+        Filter::Portfolio => 8,
     })
     .highlight_style(
         Style::default()
@@ -380,17 +512,18 @@ fn draw_list(f: &mut Frame, app: &mut App) {
             .add_modifier(Modifier::BOLD),
     );
 
+    let display = app.display_opps();
     let rows: Vec<Row> = app
         .filtered
         .iter()
         .map(|&idx| {
-            let opp = &app.opportunities[idx];
+            let opp = &display[idx];
             let profit_str = if opp.expected_profit > 0.0 {
                 format!("${:.2}", opp.expected_profit)
             } else {
                 "\u{2014}".to_string()
             };
-            let apy_str = match opp.annualized_return() {
+            let apy_str = match opp.annualized_return_leveraged(leverage) {
                 Some(apy) => format!("{:.1}%", apy * 100.0),
                 None => "\u{2014}".to_string(),
             };
@@ -433,7 +566,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
 
     // Footer
     let footer = Paragraph::new(
-        " \u{2191}\u{2193}/jk Navigate | Enter Detail | 1/2/3 Filter | s Sort | q Quit",
+        " \u{2191}\u{2193}/jk Navigate | Enter Detail | 1-9 Filter | s Sort | l Leverage | q Quit",
     )
     .style(Style::default().fg(Color::DarkGray));
     f.render_widget(footer, chunks[3]);
@@ -444,7 +577,7 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
         .table_state
         .selected()
         .and_then(|i| app.filtered.get(i))
-        .map(|&idx| app.opportunities[idx].clone())
+        .map(|&idx| app.display_opps()[idx].clone())
     {
         Some(o) => o,
         None => {
@@ -457,7 +590,7 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
         Constraint::Length(3),
         Constraint::Length(4),
         Constraint::Min(5),
-        Constraint::Length(7),
+        Constraint::Length(9),
         Constraint::Length(1),
     ])
     .split(f.area());
@@ -532,12 +665,19 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
     }
 
     // Profit info
+    let leverage = app.leverage();
+    let leveraged_cost = opp.leveraged_cost(leverage);
     let mut info_lines = Vec::new();
     if opp.total_cost != 0.0 {
-        info_lines.push(Line::from(format!(
-            "  Total Cost:      ${:.2}",
-            opp.total_cost
-        )));
+        let cost_label = if leverage > 1.0 {
+            format!(
+                "  Capital ({}x):    ${:.2}  (full: ${:.2})",
+                leverage as i32, leveraged_cost, opp.total_cost
+            )
+        } else {
+            format!("  Total Cost:      ${:.2}", opp.total_cost)
+        };
+        info_lines.push(Line::from(cost_label));
     }
     if opp.expected_profit > 0.0 {
         info_lines.push(Line::from(vec![
@@ -549,13 +689,18 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
-        if opp.total_cost.abs() > 1.0 {
-            let roi = (opp.expected_profit / opp.total_cost.abs()) * 100.0;
+        if leveraged_cost > 1.0 {
+            let roi = (opp.expected_profit / leveraged_cost) * 100.0;
             info_lines.push(Line::from(format!("  ROI:             {:.2}%", roi)));
         }
-        if let Some(apy) = opp.annualized_return() {
+        if let Some(apy) = opp.annualized_return_leveraged(leverage) {
+            let apy_label = if leverage > 1.0 {
+                format!("  APY ({}x):        ", leverage as i32)
+            } else {
+                "  Annualized (APY): ".to_string()
+            };
             info_lines.push(Line::from(vec![
-                Span::raw("  Annualized (APY): "),
+                Span::raw(apy_label),
                 Span::styled(
                     format!("{:.1}%", apy * 100.0),
                     Style::default()
